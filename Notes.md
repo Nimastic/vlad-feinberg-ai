@@ -1,7 +1,3 @@
-# Questions I Have:
-- What is RAG
-- What is Vector Database
-
 # Get off your soapbox
 work at the edges of where frontier labs operate
 
