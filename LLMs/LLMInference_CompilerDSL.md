@@ -24,7 +24,7 @@ Decoder-only Large Language Models (LLMs) suffer from memory-bandwidth bottlenec
 | **Model Requirements** | Dual models (Draft Model + Target Model) | Single unified model with $N$ prediction heads |
 | **Training Modification** | None (Post-hoc inference optimization) | Requires pretraining / fine-tuning with MTP loss |
 | **Memory Footprint** | High VRAM usage for dual model weights | Slightly higher projection head parameters |
-| **Acceptance / Yield** | Dynamic based on Draft-Target alignment | Deterministic multi-token head predictions |
+| **Acceptance / Yield** | Dynamic based on Draft-Target alignment | Extra heads still emit probability distributions (not deterministic); when used for self-speculation, later tokens are verified/accepted like speculative decoding |
 
 ---
 
