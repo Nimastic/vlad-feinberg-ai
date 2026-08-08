@@ -9,11 +9,13 @@ Visual and technical study notes on LLM / Transformer internals, based on 3Blue1
 | Chapter | Title | Key Topics |
 | :--- | :--- | :--- |
 | **[1. GPT & Transformer Overview](GPT_TransformerOverview.md)** | Autoregressive loop, embeddings, unembedding, Softmax / Temperature |
-| **[2. Attention Mechanism](AttentionMechanism.md)** | Q/K/V, scaled dot-product, causal masking, multi-head & cross-attention |
+| **[2. Attention Mechanism](AttentionMechanism.md)** | Q/K/V, scaled dot-product, causal masking, multi-head & cross-attention, **KV cache & sparse/hybrid long-context tradeoffs** |
 | **[3. MLPs & Superposition](MLP_Superposition.md)** | MLP as associative memory, activations, superposition, SAEs |
 | **[4. Context Window & Billing Q&A](ContextWindow_BillingQA.md)** | Read vs write tokens, rate limits, stateless history, prompt caching |
 
-Related notes in this folder: [RLHF / SFT / DPO](RLHF_SFT_DPO_Pipeline.md) · [LLM Inference & Compiler DSLs](LLMInference_CompilerDSL.md)
+Related notes in this folder: [RLHF / SFT / DPO](RLHF_SFT_DPO_Pipeline.md) · [LLM Inference & Compiler DSLs](LLMInference_CompilerDSL.md) · [Kimi K3](Notes%20on%20KIMIK3.md)
+
+Interview-style depth on KV cache / GQA / sparse reduction: root [`Questions.md`](../Questions.md) Q5, Q12, Q21, Q22.
 
 ---
 

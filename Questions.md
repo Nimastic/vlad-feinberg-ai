@@ -61,17 +61,27 @@ A Vector Database is a specialized database designed to store, index, and query 
 ## 5. What is a KV Cache, how does it work, and why is it an inference bottleneck?
 
 **Answer:**
-A **KV (Key-Value) Cache** is a memory optimization technique used during autoregressive LLM decoding to store the Key ($K$) and Value ($V$) projection tensors calculated for all preceding tokens in a sequence.
+A **KV (Key-Value) Cache** is a memory optimization technique used during autoregressive LLM decoding to store the Key ($K$) and Value ($V$) projection tensors calculated for all preceding tokens in a sequence—so the model does not recompute past attention inputs for every newly generated token.
 
 - **How It Works:**
-  - LLMs generate text token-by-token (autoregressively).
-  - To produce each new token, the current Query token must attend to all previous tokens in the context window.
-  - Instead of recomputing $K$ and $V$ tensors for past tokens at every generation step (which would require $O(N^2)$ redundant matrix multiplications), the model computes $K$ and $V$ once for each token and caches them in GPU memory (HBM).
-  - On step $N+1$, the model only computes $K_{N+1}$ and $V_{N+1}$ and appends them to the cache.
+  - In self-attention, each token is projected into Query ($Q$), Key ($K$), and Value ($V$) vectors.
+  - LLMs generate text token-by-token (autoregressively). To produce each new token, the current Query must attend to past Keys/Values in the context window.
+  - Instead of recomputing $K$ and $V$ for all past tokens at every generation step (redundant work that scales badly with sequence length), the model computes $K$ and $V$ once per token and caches them in GPU memory (HBM).
+  - On step $N+1$, the model only computes $K_{N+1}$ and $V_{N+1}$ and appends them to the cache, then attends using the cached history.
+
+- **Where it sits in the forward pass (Prefill vs Generation):**
+  The transformer forward pass at inference is split into two phases; the KV cache is central to both, but is *read/appended* most critically during generation:
+
+  1. **Prefill:** The full input prompt is processed in parallel (compute-bound). Initial $K$/$V$ tensors for all prompt tokens are computed and written into the cache.
+  2. **Generation (decode):** A fast single-token forward pass runs repeatedly. Each step reads the accumulated KV cache for past context, predicts the next token, and appends that token's new $K$/$V$ to the cache.
+
+  So yes—KV caching is used during the autoregressive generation loop (iterative forward passes). Prefill *builds* the cache; decode *reuses and extends* it. (This is distinct from *prompt caching* across API requests—see `LLMs/ContextWindow_BillingQA.md`.)
 
 - **Why It Becomes an Inference Bottleneck:**
   1. **VRAM Memory Footprint:** The size of the KV cache grows linearly with context length ($\text{len\_ctx}$) and batch size ($B$). At long contexts (e.g., $100\text{k}+$ tokens), the KV cache size can surpass the memory needed to store the model weights themselves.
   2. **Memory Bandwidth (HBM) Limit:** On every single decode step, the GPU must fetch the entire accumulated KV cache from HBM. As context grows, loading the KV cache turns the system from compute-bound to memory-bandwidth-bound, imposing a speed ceiling and causing price tier jumps (e.g., Gemini's $+200\text{k}$ context pricing kink).
+
+- **Related:** How systems shrink this cache → **Q21**. Sparse-attention tradeoffs → **Q22**. Architectural KV head sharing (MQA/GQA) → **Q12**.
 
 ---
 
@@ -367,3 +377,39 @@ flowchart LR
 1. **Vision Encoder (ViT):** Divides input images into fixed patches (e.g., $14 \times 14$ pixels), projects them into patch embeddings, and extracts dense visual representations.
 2. **Vision Projection Adapter:** An MLP or cross-attention projection layer maps visual embeddings into the exact hidden dimension space of the language backbone. Special tokens (e.g., `[IMG]`, `[IMG_BREAK]`, `[IMG_END]`) delineate image boundaries.
 3. **Language Backbone:** The LLM treats projected vision tokens identically to text token embeddings, attending across visual and textual contexts via standard self-attention to generate multimodal responses autoregressively.
+
+---
+
+## 21. How do modern systems shrink KV-cache memory cost (sparse/eviction, architecture, compression)?
+
+**Answer:**
+Storing $K$/$V$ for every past token becomes unsustainable at long context and large batch. Systems shrink, compress, or drop cache entries along three complementary axes:
+
+### 1. Sparse & Eviction-Based Attention
+Instead of keeping everything, drop less important tokens from the cache (or never materialize them):
+- **H2O (Heavy Hitter Oracle):** Keeps frequently attended-to tokens ("heavy hitters") plus recent tokens; evicts the rest.
+- **StreamingLLM:** Retains a few early **attention sink** tokens plus a local recent window—enabling very long / unbounded generation without unbounded KV growth.
+- **Architectural sparse patterns** (sliding window, block-sparse, DeepSeek-style sparse attention): reduce which past positions each query may attend to, so fewer KV entries must be kept or fetched.
+
+### 2. Structural / Architectural Reductions
+Change how attention is built so each layer naturally emits fewer unique KV tensors:
+- **Multi-Query Attention (MQA):** One shared $K$/$V$ head across all Query heads → large KV-cache cut (often ~$8\times$–$16\times$ vs MHA).
+- **Grouped-Query Attention (GQA):** Middle ground—groups of Query heads share a smaller set of KV heads (Llama, Mistral, etc.). Full breakdown in **Q12**.
+- **Hybrid stacks** (e.g., Kimi K3's 3 KDA : 1 MLA): only a subset of layers keep a full softmax KV cache; linear/recurrent layers use fixed-size state instead.
+
+### 3. Compression & Quantization
+- **KV-cache quantization:** Store cached $K$/$V$ at lower precision (e.g., FP16 → INT8/INT4), cutting cache bytes ~$2\times$–$4\times$ while keeping history length.
+- Related serving tricks (prefix / prompt caching) reuse a *computed* prefix across requests rather than shrinking per-step decode memory—see `LLMs/ContextWindow_BillingQA.md`.
+
+---
+
+## 22. What are the downsides of sparse attention (and sparse KV caching)?
+
+**Answer:**
+The core downside is **loss of long-range retrieval fidelity**: the model may miss, "forget," or hallucinate details that a dense full-attention + full KV cache would have kept available.
+
+- **Needle-in-a-haystack failure:** Important facts in the middle of a long context get evicted or never attended if the sparse policy favors sinks + recent tokens (or other fixed patterns).
+- **Permanent information loss (eviction caches):** Once a token's $K$/$V$ is dropped to save memory, it cannot be recovered later if that context suddenly becomes relevant.
+- **Degraded multi-hop / long-horizon reasoning:** Tasks that need distant but related pieces (large codebases, long proofs, legal docs) suffer when connections cannot be formed across dropped positions.
+- **Hardware inefficiency risk:** GPUs excel at dense, regular matmuls. Irregular sparse patterns can add gather/scatter overhead that erodes theoretical FLOP savings—sometimes little wall-clock win despite less math.
+- **Why hybrids exist:** Modern frontiers often **interleave** dense (or MLA) layers with sparse/linear layers so some layers retain precise retrieval while others keep memory/compute cheap—trading purity of either extreme for a better quality–throughput curve (see Kimi KDA/MLA notes; conceptual overview in `LLMs/AttentionMechanism.md`).

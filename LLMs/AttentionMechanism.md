@@ -136,6 +136,20 @@ flowchart LR
     N3["N = 128k"] --> C3["~16B pairs"]
 ```
 
+### Inference: KV Cache (why past $K$/$V$ are kept)
+
+At **training** or prompt **prefill**, many tokens can be processed in parallel. At **decode**, the model emits one token at a time. Without caching, each new step would recompute Keys and Values for the entire past sequence.
+
+**KV cache** stores past $K$ and $V$ tensors so each decode step only projects the newest token, appends its $K$/$V$, and attends against the cache. That buys real-time generation—but cache size grows with context length and batch size, and every decode step must reload the cache from GPU HBM (often the true bottleneck, not FLOPs).
+
+Because a full cache is expensive, systems either:
+- **Shrink structurally** (fewer KV heads via GQA/MQA),
+- **Drop / sparsify** which past tokens stay addressable (sliding window, eviction policies like H2O / StreamingLLM sinks),
+- **Compress** cached tensors (KV quantization), or
+- **Replace** some layers with linear/recurrent state (e.g. KDA) so those layers do not grow a full KV list—often hybridized with a few dense/MLA layers for retrieval quality.
+
+Tradeoff in one line: sparse or compressed attention saves memory/compute, but can miss mid-context “needles” and hurt long-horizon reasoning if the dropped history mattered. Interview-depth Q&A: `Questions.md` **Q5**, **Q12**, **Q21**, **Q22**.
+
 ---
 
 ## 5. Value Vectors ($v_i$) & Vector Updates
