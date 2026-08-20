@@ -136,19 +136,61 @@ flowchart LR
     N3["N = 128k"] --> C3["~16B pairs"]
 ```
 
-### Inference: KV Cache (why past $K$/$V$ are kept)
+### Inference: KV Cache (Why Past $K$/$V$ are Kept)
 
-At **training** or prompt **prefill**, many tokens can be processed in parallel. At **decode**, the model emits one token at a time. Without caching, each new step would recompute Keys and Values for the entire past sequence.
+At **training** or prompt **prefill**, all tokens are processed in parallel (compute-bound matrix multiplications). At **decode**, the model emits one token at a time autoregressively.
 
-**KV cache** stores past $K$ and $V$ tensors so each decode step only projects the newest token, appends its $K$/$V$, and attends against the cache. That buys real-time generation—but cache size grows with context length and batch size, and every decode step must reload the cache from GPU HBM (often the true bottleneck, not FLOPs).
+Without KV caching, generating each new token would require feeding the entire historical sequence back through all transformer layers from scratch.
 
-Because a full cache is expensive, systems either:
-- **Shrink structurally** (fewer KV heads via GQA/MQA),
-- **Drop / sparsify** which past tokens stay addressable (sliding window, eviction policies like H2O / StreamingLLM sinks),
-- **Compress** cached tensors (KV quantization), or
-- **Replace** some layers with linear/recurrent state (e.g. KDA) so those layers do not grow a full KV list—often hybridized with a few dense/MLA layers for retrieval quality.
+#### Computational Complexity Breakdown: Naive vs. KV-Cached Generation
 
-Tradeoff in one line: sparse or compressed attention saves memory/compute, but can miss mid-context “needles” and hurt long-horizon reasoning if the dropped history mattered. Interview-depth Q&A: `Questions.md` **Q5**, **Q12**, **Q21**, **Q22**.
+```mermaid
+flowchart TD
+    subgraph Naive ["Naive Transformer (No KV Cache)"]
+        direction TB
+        N1["Turn N: Recompute Q, K, V for all N tokens"] --> N2["Full N × N Attention Matrix: O(N²) math"]
+        N2 --> N3["Sequence Sum: ∑ i² → O(N³) Cubic Cost"]
+    end
+
+    subgraph Cached ["Production Transformer (With KV Cache)"]
+        direction TB
+        C1["Turn N: Compute Q, K, V for 1 new token only"] --> C2["Dot-product 1 Query against N cached Keys: O(N) math"]
+        C2 --> C3["Sequence Sum: ∑ i → O(N²) Quadratic Cost"]
+    end
+```
+
+1. **Per-Token Computation**:
+   * **Without KV Cache ($\mathcal{O}(N^2)$ per token)**: The model recomputes $Q, K, V$ projections and dense MLP layers for all $N$ tokens ($\mathcal{O}(N)$), then computes the full attention matrix $Q K^T$ ($N \times N = \mathcal{O}(N^2)$ math). Dominated by attention, generating just one token costs $\mathcal{O}(N^2)$ FLOPs.
+   * **With KV Cache ($\mathcal{O}(N)$ per token)**: The model projects only the **single new token** ($\mathcal{O}(1)$ layer computations) and appends its $K, V$ vectors to the cache. The single new Query vector $q_{N+1}$ is dot-multiplied against all $N$ cached Key vectors ($q_{N+1} K^T$), scaling linearly as $\mathcal{O}(N)$.
+
+2. **Per-Token Memory Bandwidth ($\mathcal{O}(1)$ Parameters + $\mathcal{O}(N)$ Cache Fetch)**:
+   * Autoregressive decode is memory-bandwidth bound. Every single token generation requires reloading the entire model weight matrix from GPU HBM to SRAM/registers (constant $\mathcal{O}(1)$ time per token).
+   * Fetching the accumulated KV cache from HBM scales linearly as $\mathcal{O}(N)$.
+
+3. **Cumulative Sequence Cost ($\mathcal{O}(N^3)$ Naive vs. $\mathcal{O}(N^2)$ Cached)**:
+   * **Naive Sequence Generation**: Token $1$ takes $1^2$ ops, Token $2$ takes $2^2$ ops, $\dots$, Token $N$ takes $N^2$ ops:
+     $$\text{Total Cost} = \sum_{i=1}^N i^2 = \frac{N(N+1)(2N+1)}{6} \sim \mathcal{O}(N^3) \quad \text{(Cubic Complexity)}$$
+   * **KV-Cached Sequence Generation**: Token $1$ takes $1$ op, Token $2$ takes $2$ ops, $\dots$, Token $N$ takes $N$ ops:
+     $$\text{Total Cost} = \sum_{i=1}^N i = \frac{N(N+1)}{2} \sim \mathcal{O}(N^2) \quad \text{(Quadratic Complexity)}$$
+   * **Linear Attention / State Space Models (Mamba, RWKV)**: Maintain fixed-size recurrent hidden states ($\mathcal{O}(1)$ per token), reducing total sequence generation to true $\mathcal{O}(N)$ linear cost.
+
+#### Complexity Summary Comparison Table
+
+| Dimension | Naive Generation (No KV Cache) | Real-World Generation (With KV Cache) | State Space Models (Mamba / RWKV) |
+| :--- | :--- | :--- | :--- |
+| **Layer Forward Pass / Token** | $\mathcal{O}(N)$ full layer passes | $\mathcal{O}(1)$ (New token only) | $\mathcal{O}(1)$ (Recurrent state update) |
+| **Attention Math / Token** | $\mathcal{O}(N^2)$ ($N \times N$ matrix recompute) | $\mathcal{O}(N)$ ($1$ Query vs. $N$ cached Keys) | $\mathcal{O}(1)$ (Constant-size state) |
+| **Total Cost for Sequence of Length $N$** | $\mathcal{O}(N^3)$ (Cubic scaling) | $\mathcal{O}(N^2)$ (Quadratic scaling) | $\mathcal{O}(N)$ (Linear scaling) |
+| **GPU Bottleneck** | Compute & Memory bound | Memory-Bandwidth bound (HBM fetch) | Compute bound |
+
+#### Modern KV Cache Shrinking Techniques
+Because keeping a massive $\mathcal{O}(N)$ KV cache consumes VRAM at long contexts, production systems deploy:
+- **Structural reductions** (fewer KV heads via GQA/MQA),
+- **Sparse attention / eviction** (H2O, StreamingLLM attention sinks),
+- **KV-cache quantization** (INT8/INT4 precision), or
+- **Hybrid architectures** (interleaving linear layers like KDA with dense MLA/softmax layers).
+
+Interview-depth Q&A: `Questions.md` **Q5**, **Q12**, **Q21**, **Q22**, **Q25**.
 
 ---
 

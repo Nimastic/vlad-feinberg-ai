@@ -413,3 +413,150 @@ The core downside is **loss of long-range retrieval fidelity**: the model may mi
 - **Degraded multi-hop / long-horizon reasoning:** Tasks that need distant but related pieces (large codebases, long proofs, legal docs) suffer when connections cannot be formed across dropped positions.
 - **Hardware inefficiency risk:** GPUs excel at dense, regular matmuls. Irregular sparse patterns can add gather/scatter overhead that erodes theoretical FLOP savings—sometimes little wall-clock win despite less math.
 - **Why hybrids exist:** Modern frontiers often **interleave** dense (or MLA) layers with sparse/linear layers so some layers retain precise retrieval while others keep memory/compute cheap—trading purity of either extreme for a better quality–throughput curve (see Kimi KDA/MLA notes; conceptual overview in `LLMs/AttentionMechanism.md`).
+
+---
+
+## 23. Why does asking questions one-by-one cost more in LLM API tokens than sending a single batched request?
+
+**Answer:**
+Sequential question-by-question querying incurs significantly higher token and monetary costs than batching multiple questions into a single consolidated request, even if the total question count and text are identical.
+
+- **1. Repetition of System Prompts & Core Instructions:**
+  Every distinct API turn requires passing the system prompt, formatting rules, and tool schemas. If a system prompt is $2,000$ tokens, asking $10$ questions sequentially bills $20,000$ input tokens just for repeating the instructions ($10 \times 2,000$). In a batched prompt, the instructions are ingested once ($2,000$ tokens).
+
+- **2. Compounding Multi-Turn History ($\mathcal{O}(N^2)$ Growth):**
+  In multi-turn chat threads, the stateless API requires the client to retransmit previous turns. As dialogue progresses:
+  - Turn 1 reads: $Q_1$
+  - Turn 2 reads: $Q_1 + A_1 + Q_2$
+  - Turn 3 reads: $Q_1 + A_1 + Q_2 + A_2 + Q_3$
+  
+  Total input tokens scale quadratically ($\mathcal{O}(N^2)$), whereas a single batched prompt reads all questions in one linear pass ($\mathcal{O}(N)$).
+
+- **3. Request & Connection Overhead:**
+  Multiple individual requests incur repetitive network latency, HTTP framing, and separate generation initialization rather than a single decode stream.
+
+- **4. Maximizing Prompt Caching:**
+  When questions share a large static reference document (or when running evaluation benchmarks), sending a single consolidated batch allows LLM providers with prompt caching (Anthropic, OpenAI, DeepSeek, Google Gemini) to prefill the context once and discount subsequent processing.
+
+*(See detailed diagrams, cost formulas, and reference tables in `LLMs/ContextWindow_BillingQA.md` Section 5.)*
+
+---
+
+## 24. How do major LLM providers (Anthropic, OpenAI, Google Gemini, DeepSeek, AWS Bedrock) implement prompt caching, and what are their TTL and pricing structures?
+
+**Answer:**
+Modern LLM inference engines retain precomputed Key ($K$) and Value ($V$) attention activations for stable prompt prefixes in GPU VRAM (or multi-tier storage) to eliminate redundant prefill matrix multiplications on subsequent requests.
+
+### 1. Provider Caching & TTL Comparison
+
+| Provider / Model | Caching Mechanism | Inactivity TTL (Lifetime) | Cache Write Pricing | Cache Read (Hit) Pricing | Key Eviction / Storage Trait |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Anthropic** *(Claude 3.5 / 3.7 Sonnet, Opus)* | **Explicit** (`cache_control`) | **5 minutes** (sliding); optional 1-hr tier | **$1.25\times$** base input ($2\times$ for 1-hr) | **$0.10\times$** ($90\%$ discount) | Up to 4 breakpoints. Strict sliding TTL resets on hit; evicts after 5 min of silence. |
+| **OpenAI** *(GPT-4o, o1, o3-mini)* | **Automatic** (Prefix $>1{,}024$ tok) | **5–10 minutes** in-memory (up to 1 hr; 24 hr off-peak) | **$1.0\times$** base input (No write fee) | **$50\% - 80\%$ discount** | Automatic prefix matching from token 0; routes via `prompt_cache_key`. |
+| **Google Gemini (Implicit)** *(2.0 Flash / Pro)* | **Automatic / Implicit** | System-managed | **$1.0\times$** base input | **$75\% - 90\%$ discount** | Opportunistic caching with no storage fees. |
+| **Google Gemini (Explicit)** *(1.5 Pro, 3.7 Flash)* | **Explicit** (`CachedContent`) | User-defined (**1 hour** default) | **$1.0\times$** base input | **$75\% - 90\%$ discount** | **Hourly Storage Fee**: Charged per 1M tokens/hour (e.g. $\$0.50 - \$1.00/\text{M}/\text{hr}$) for duration of active TTL. |
+| **DeepSeek** *(DeepSeek-V3, R1)* | **Automatic** (Multi-tier Disk + RAM) | Opportunistic / System-managed | **$1.0\times$** base input | **$\approx 90\%$ discount** ($\$0.014/\text{M}$) | Multi-tier NVMe + GPU caching; auto-evicted on cluster memory pressure. |
+| **AWS Bedrock** *(Claude, Titan)* | **Explicit** (`cachePoint`) | **5 minutes** (sliding) | **$1.25\times$** base input | **Up to $90\%$ discount** | Explicit checkpoint markers; sliding TTL resets on hit. |
+| **Self-Hosted** *(vLLM / SGLang)* | **RadixAttention / Paged Prefix** | **LRU Memory Bound** (No time TTL) | Local GPU FLOP cost | **Zero FLOP prefill** | Radix tree in GPU VRAM; evicts on memory pressure via LRU. |
+
+### 2. The Three Critical Rules of Prompt Caching
+1. **The Fragility Rule (Left-to-Right Matching)**: LLMs match prefixes cryptographically from token 0. If a single dynamic character (like a timestamp or variable prompt header) is placed before static instructions, the hash breaks and the entire cache is invalidated.
+2. **The "Coffee Break" / TTL Expiration Trap**: If an agent builds an 80k-token session and pauses for longer than the TTL window (e.g., >5 minutes on Claude), the GPU memory is freed. The very next prompt triggers an uncached re-prefill billed at full input / write-premium rates.
+3. **Model Isolation**: KV caches are strictly model-specific. Switching models mid-chat (e.g., from Claude 3.5 Sonnet to GPT-4o) forces a 100% uncached re-ingestion of the entire conversation transcript.
+
+*(Full architectural deep dive and diagrams in `LLMs/Agent_Harness_Engineering.md` Section 5 & `LLMs/ContextWindow_BillingQA.md` Section 4.)*
+
+---
+
+## 25. Is autoregressive token generation an $\mathcal{O}(N^2)$ operation per token, and how does KV caching prevent $\mathcal{O}(N^3)$ sequence complexity?
+
+**Answer:**
+**No.** In real-world LLMs, token generation is **$\mathcal{O}(N)$ (linear)** in computation and **$\mathcal{O}(1)$ (constant)** in layer forward passes per generated token—**thanks entirely to the KV Cache**. 
+
+However, in an unoptimized, naive Transformer without KV caching, token generation explodes to **$\mathcal{O}(N^2)$ per token** and **$\mathcal{O}(N^3)$ (cubic) for a full sequence of length $N$**.
+
+```mermaid
+flowchart LR
+    subgraph Naive ["Naive Transformer (No Cache)"]
+        direction TB
+        N1["Turn N: Full Q, K, V recompute"]
+        N2["O(N²) FLOPs per token"]
+        N3["∑ i² → O(N³) Total Sequence"]
+    end
+
+    subgraph Cached ["Production LLM (With KV Cache)"]
+        direction TB
+        C1["Turn N: 1 Query vs N cached Keys"]
+        C2["O(N) FLOPs per token"]
+        C3["∑ i → O(N²) Total Sequence"]
+    end
+
+    Naive -.-> N3
+    Cached -.-> C3
+```
+
+### 1. Why a Single Token Costs $\mathcal{O}(N^2)$ Without KV Caching
+Without caching past activations, generating token $N+1$ requires feeding all $N$ preceding tokens through the network from scratch:
+- **Full Attention Matrix Recomputation ($\mathcal{O}(N^2)$)**: The model must recompute Query ($Q$), Key ($K$), and Value ($V$) projections for all $N$ tokens, followed by the full $Q K^T$ matrix multiplication ($N \times N = \mathcal{O}(N^2)$ operations).
+- **MLP Layer Passes ($\mathcal{O}(N)$)**: Re-runs feed-forward network layers for all $N$ tokens.
+- **Single Token Result**: The $\mathcal{O}(N^2)$ attention step dominates, forcing a cost of $\mathcal{O}(N^2)$ FLOPs for just one next token.
+
+### 2. How KV Caching Drops Per-Token Cost to $\mathcal{O}(N)$
+By storing past $K$ and $V$ tensors in GPU memory (HBM):
+- **Single Layer Forward Pass ($\mathcal{O}(1)$)**: The model projects $W_Q, W_K, W_V$ and passes MLP layers for the **1 single newly generated token only**.
+- **Vector-Matrix Attention ($\mathcal{O}(N)$)**: The single Query vector $q_{N+1}$ is dot-multiplied against the $N$ cached Key vectors ($q_{N+1} K^T$), requiring only $1 \times N = \mathcal{O}(N)$ math.
+- **Memory Bandwidth Bottleneck**: Loading fixed model parameter weights takes $\mathcal{O}(1)$ time, while fetching the KV cache takes $\mathcal{O}(N)$ time. LLM decoding is memory-bandwidth bound, not compute bound.
+
+### 3. Total Cost for a Whole Sequence ($\mathcal{O}(N^3)$ vs $\mathcal{O}(N^2)$)
+
+$$\text{Naive Sequence Cost (No Cache)} = \sum_{i=1}^N i^2 = \frac{N(N+1)(2N+1)}{6} \sim \mathcal{O}(N^3) \quad \text{(Cubic)}$$
+
+$$\text{Real-World Sequence Cost (KV Cache)} = \sum_{i=1}^N i = \frac{N(N+1)}{2} \sim \mathcal{O}(N^2) \quad \text{(Quadratic)}$$
+
+$$\text{State Space / Linear Attention (Mamba, RWKV)} = \sum_{i=1}^N \mathcal{O}(1) = \mathcal{O}(N) \quad \text{(Linear)}$$
+
+### 4. Complexity Comparison Matrix
+
+| Metric / Dimension | Naive Generation (No KV Cache) | Real-World Generation (With KV Cache) | State Space Models (Mamba / RWKV) |
+| :--- | :--- | :--- | :--- |
+| **Layer Computations / Token** | $\mathcal{O}(N)$ (Passes all $N$ tokens) | $\mathcal{O}(1)$ (Passes 1 new token) | $\mathcal{O}(1)$ (Constant state step) |
+| **Attention Math / Token** | $\mathcal{O}(N^2)$ ($N \times N$ matrix) | $\mathcal{O}(N)$ ($1 \times N$ vector-matrix) | $\mathcal{O}(1)$ (No attention matrix) |
+| **Total Sequence Cost (Length $N$)** | $\mathcal{O}(N^3)$ (Cubic scaling) | $\mathcal{O}(N^2)$ (Quadratic scaling) | $\mathcal{O}(N)$ (Linear scaling) |
+| **Hardware Constraint** | Compute & Memory bound | Memory-Bandwidth bound (HBM fetch) | Compute bound |
+
+*(See full breakdown and architectural diagrams in `LLMs/AttentionMechanism.md` Section 4.)*
+
+---
+
+## 26. How are Ask Mode, Plan Mode, and Agent Mode architected differently, why can't skills run in Ask Mode, and how does Progressive Disclosure govern skill loading?
+
+**Answer:**
+AI coding harnesses partition workflows into three distinct architectural execution modes to balance latency, system safety, token budgets, and tool execution capabilities:
+
+### 1. Architectural System Comparison
+
+| Architectural Element | Ask Mode | Plan Mode | Agent Mode |
+| :--- | :--- | :--- | :--- |
+| **Control Loop Style** | **Linear** (Direct single-pass pipeline) | **Hierarchical** (DAG blueprint generation) | **Cyclical** (ReAct engine execution loop) |
+| **Tool Registry State** | **Purged & Locked** (Zero function-calling tokens) | **Read-Only Verification** (`view_file`, `list_dir`, grep) | **Read & Write Executable** (Terminal, edits, subagents, MCP) |
+| **Primary Metric** | **Time-to-First-Token (TTFT)** & Streaming Speed | **Structural Accuracy** & Dependency Validation | **Autonomous Goal Resolution Rate** |
+| **Token Cost Profile** | **Minimal** (Single pass, no loop overhead) | **Moderate** (Blueprint evaluation pass) | **High** (Iterative multi-turn state growth) |
+| **Skill Loading State** | **Bypassed** (No discovery/loading parser) | **Structural Checker** (Architecture compliance) | **Dynamic On-Demand** (Progressive disclosure) |
+
+### 2. Why "Formatting-Only" Skills Cannot Run in Ask Mode
+Even if a skill has no executable code and only defines markdown formatting rules, it cannot run in Ask Mode due to two architectural constraints:
+1. **Context Window Routing & Token Optimization**: Ask Mode purges tool schemas and skill directories from the system prompt to keep input tokens minimal and maximize streaming response speed.
+2. **Absence of Parser Middleware**: Agent Mode runs a ReAct loop with execution middleware that detects when a skill is needed and injects its body. Ask Mode is a flat, direct system-prompt pipeline without this background parser.
+
+### 3. How Progressive Disclosure Governs Dynamic Skill Loading
+The IDE agent does **not** read every skill file on every prompt. It follows a 3-tier **Progressive Disclosure** pattern:
+1. **Startup Discovery**: The harness parses *only* the top YAML frontmatter (`name` and `description`) of all available skills to build a lightweight routing catalog in the system prompt (~50 tokens/skill).
+2. **Per-Prompt Routing**: On every user prompt, the LLM evaluates the query against the catalog metadata.
+3. **On-Demand Activation**: Only if a skill matches is the full `SKILL.md` body (and its scripts/references) loaded into active context.
+4. **Manual Override**: Setting `disable-model-invocation: true` in the frontmatter ensures the skill is only triggered via explicit user slash-command (e.g., `/deploy`).
+
+*(Full architectural deep dive and diagrams in `LLMs/Agent_Harness_Engineering.md` Sections 7, 9, & 10.)*
+
+
+
+

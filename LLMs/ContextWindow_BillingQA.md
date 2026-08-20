@@ -147,15 +147,79 @@ flowchart LR
     R2 --> Save["Skip most matmuls<br/>bill discounted reads"]
 ```
 
-* **How it Works**: The Key ($K$) and Value ($V$) activations computed for a prompt prefix are retained (in GPU VRAM or a managed cache tier) so an identical prefix on a later request can skip recomputation. Caches are short-lived (typical TTL ~5 min, optionally ~1 hour).
-* **Cost Discount**: Provider- and era-dependent, so don't treat one number as universal:
-  * **Anthropic**: cache *reads* ≈ **90% off** (0.1× input), but the initial cache *write* costs ~1.25× (5 min) or ~2× (1 hour).
-  * **OpenAI**: the 2024 GPT-4o/o1 launch was a **50% discount**; newer model families moved cached reads closer to ~90% (0.1×) with a cache-write premium.
-* **Speedup**: Dramatically reduces Time-To-First-Token (TTFT) on cache hits.
+* **How it Works**: The Key ($K$) and Value ($V$) activations computed for a prompt prefix are retained (in GPU VRAM, high-speed NVMe, or a managed cache tier) so an identical prefix on a later request can skip recomputation.
+* **Speedup**: Dramatically reduces Time-To-First-Token (TTFT) on cache hits by avoiding redundant matrix multiplications during prefill.
+
+#### Provider Cache Architecture, TTL & Billing Comparison
+
+| Provider / Model | Caching Type | Default Inactivity TTL | Cache Write Cost | Cache Read (Hit) Cost | Eviction / Storage Model |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Anthropic** *(Claude 3.5/3.7 Sonnet, Opus)* | **Explicit** (`cache_control`) | **5 minutes** (sliding); optional 1-hr tier | **$1.25\times$** base input ($2\times$ for 1-hr) | **$0.10\times$** ($90\%$ off) | Strict sliding TTL. Re-evaluates entire prefix upon expiration. |
+| **OpenAI** *(GPT-4o, o1, o3-mini)* | **Automatic** (Prefix $>1{,}024$ tok) | **5–10 minutes** (up to 1 hr off-peak) | **$1.0\times$** base input (No write fee) | **$0.50\times - 0.20\times$** ($50\% - 80\%$ off) | Automatic in-memory cache; evicted dynamically based on server load. |
+| **Google Gemini (Implicit)** *(2.0 Flash / Pro)* | **Automatic** | System-managed | **$1.0\times$** base input | **$\approx 75\% - 90\%$ off** | No storage fee; opportunistic caching. |
+| **Google Gemini (Explicit)** *(1.5 Pro, 3.7 Flash)* | **Explicit** (`CachedContent`) | User-defined (**1 hour** default) | **$1.0\times$** base input | **$75\% - 90\%$ off** | **Hourly Storage Fee**: Charged per 1M tokens/hour (e.g. $\$0.50 - \$1.00/\text{M}/\text{hr}$) for duration of TTL. |
+| **DeepSeek** *(DeepSeek-V3, R1)* | **Automatic** (Multi-tier) | System-managed / Opportunistic | **$1.0\times$** base input | **$\approx 90\%$ off** ($\$0.014/\text{M}$) | Multi-tier NVMe/RAM cache; auto-evicted on cluster memory pressure. |
+| **AWS Bedrock** *(Claude, Titan)* | **Explicit** (`cachePoint`) | **5 minutes** (sliding) | **$1.25\times$** base input | **$90\%$ off** | Explicit cache markers; sliding TTL resets on hit. |
 
 ---
 
-## 5. Summary Reference Table
+## 5. Request Strategy: Question-by-Question vs. Batched Prompts
+
+### Q5: Why does asking questions one-by-one cost significantly more than sending a single batched prompt?
+
+**Answer**:
+Sending questions sequentially one-by-one in separate turns or API requests generally costs significantly more than sending a single batched prompt containing all questions, even when the total question text is identical.
+
+```mermaid
+flowchart LR
+    subgraph QQ ["Question-by-Question (Multi-Turn)"]
+        direction TB
+        Q1["Turn 1: Prefix + Q1 → A1"]
+        Q2["Turn 2: Prefix + Q1 + A1 + Q2 → A2"]
+        Q3["Turn 3: Prefix + History + Q3 → A3"]
+        QCost["Total Ingested Tokens: O(N²)"]
+    end
+
+    subgraph Batched ["Single Mass Prompt (Batched)"]
+        direction TB
+        B["Single Request:<br/>Prefix + [Q1, Q2, Q3] → [A1, A2, A3]"]
+        BCost["Total Ingested Tokens: O(N)"]
+    end
+
+    QQ -.-> QCost
+    Batched -.-> BCost
+```
+
+#### 1. Why Question-by-Question Costs More
+1. **Instruction & System Prompt Repetition**: Every distinct API call or chat turn resends the core instructions, system prompts, schemas, and formatting rules. In multi-turn setups, this static background text is billed as input tokens repeatedly on every request.
+2. **Accumulating Chat History ($\mathcal{O}(N^2)$ Ballooning)**: Within a continuous conversation thread, the system automatically includes all preceding questions and assistant completions in every new turn. Input token count balloons with each step ($Q_1$ is sent once, but by $Q_N$, questions and answers $1$ through $N-1$ are resent repeatedly):
+   $$\text{Total Input Tokens} \approx \sum_{k=1}^N \left( S + \sum_{i=1}^{k-1} (|Q_i| + |A_i|) + |Q_k| \right) \sim \mathcal{O}(N^2)$$
+   *(where $S$ is system prompt size, $Q_i$ is question length, and $A_i$ is completion length)*.
+3. **Request & Framing Overhead**: Multiple distinct calls incur repeated connection overhead, token framing costs, and separate output completion generations rather than a single continuous decode stream.
+
+#### 2. Why a Single Mass Text Prompt is Cheaper
+1. **Shared Single Context**: Instructions, reference documents, few-shot demonstrations, and rules are ingested precisely **once** as a single input block ($\mathcal{O}(N)$ total input).
+2. **Prompt Caching Maximization**: With providers supporting prompt caching (e.g., Anthropic, OpenAI, DeepSeek, Google Gemini), sending a large, identical block of context in one request maximizes cache hits for any downstream evaluation and minimizes repeated prefill computation.
+
+```mermaid
+pie title Total Ingested Input Tokens: 5-Question Task (Illustrative)
+    "Multi-Turn Accumulating History & Re-sent Prefixes" : 78
+    "Single-Batch One-Shot Ingestion" : 22
+```
+
+| Dimension | Question-by-Question (Multi-Turn) | Batched Mass Prompt (Single Request) |
+| :--- | :--- | :--- |
+| **System Prompt Ingestion** | Re-billed $N$ times across turns | Billed exactly once |
+| **History Overhead** | Accumulating history resent on every turn ($\mathcal{O}(N^2)$) | Zero accumulated history ($\mathcal{O}(N)$ total) |
+| **Network & Connection Overhead** | $N$ HTTP roundtrips and generation handshakes | $1$ HTTP roundtrip and single generation stream |
+| **Prompt Caching Benefit** | Cache discounts apply to prefix, but history suffix still grows | Full context prefilled once / high caching efficiency |
+
+> [!TIP]
+> **Optimization Rule of Thumb**: If questions share a large background document or static evaluation instructions, always consolidate them into a single structured prompt (e.g., JSON array or numbered list) to minimize quadratic history re-billing.
+
+---
+
+## 6. Summary Reference Table
 
 | Parameter | Read / Input Tokens | Write / Output Tokens |
 | :--- | :--- | :--- |
